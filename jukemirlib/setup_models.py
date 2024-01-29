@@ -1,21 +1,27 @@
 import os
-from pathlib import Path
 from tqdm import tqdm
 import wget
 import sys
 import gc
 
 import jukebox
-from jukebox.hparams import Hyperparams, setup_hparams
+from jukebox.hparams import setup_hparams
 from jukebox.make_models import MODELS, make_prior, make_vqvae
+import jukebox.utils.dist_utils
 
 from accelerate import init_empty_weights
 
 import torch.nn as nn
 import torch
 
+from . import constants
+
 
 __all__ = ["setup_models"]
+
+# print_once is intended to be used in a distributed context; disable it
+jukebox.utils.dist_utils.print_once = print
+
 
 # this is a huggingface accelerate method, all we do is just
 # remove the type hints that we don't want to import in the header
@@ -81,7 +87,6 @@ def set_module_tensor_to_device(
 
 
 def get_checkpoint(local_path, remote_prefix):
-
     if not os.path.exists(local_path):
         remote_path = remote_prefix + local_path.split("/")[-1]
 
@@ -111,81 +116,62 @@ def load_weights(model, weights_path, device):
     del model_weights
 
 
-def setup_models(cache_dir=None, remote_prefix=None, device=None, verbose=True):
-    global VQVAE, TOP_PRIOR
-
+def setup_models(cache_dir=None, remote_prefix=None, model="5b", device=None, verbose=True):
     if cache_dir is None:
-        from .constants import CACHE_DIR
-
-        cache_dir = CACHE_DIR
+        cache_dir = constants.CACHE_DIR
 
     if remote_prefix is None:
-        from .constants import REMOTE_PREFIX
-
-        remote_prefix = REMOTE_PREFIX
+        remote_prefix = constants.REMOTE_PREFIX
 
     if device is None:
-        from .constants import DEVICE
-
-        device = DEVICE
+        device = constants.DEVICE
 
     # caching preliminaries
+    cache_dir = cache_dir + "/" + model
     vqvae_cache_path = cache_dir + "/vqvae.pth.tar"
     prior_cache_path = cache_dir + "/prior_level_2.pth.tar"
     os.makedirs(cache_dir, exist_ok=True)
 
     # get the checkpoints downloaded if they haven't been already
-    get_checkpoint(vqvae_cache_path, remote_prefix)
-    get_checkpoint(prior_cache_path, remote_prefix)
+    get_checkpoint(vqvae_cache_path, remote_prefix + "5b/")
+    get_checkpoint(prior_cache_path, remote_prefix + model + "/")
 
     if verbose:
         print("Importing jukebox and associated packages...")
+
+    priors = MODELS[model]
+    prior_hparams = setup_hparams(priors[-1], dict())
+    vqvae_hparams = setup_hparams(priors[0], dict(sample_length=prior_hparams.n_ctx * 128))
 
     # Set up VQVAE
     if verbose:
         print("Setting up the VQ-VAE...")
 
-    model = "5b"
-    hps = Hyperparams()
-    hps.sr = 44100
-    hps.n_samples = 3 if model == "5b_lyrics" else 8
-    hps.name = "samples"
-    chunk_size = 16 if model == "5b_lyrics" else 32
-    max_batch_size = 3 if model == "5b_lyrics" else 16
-    hps.levels = 3
-    hps.hop_fraction = [0.5, 0.5, 0.125]
-    VQVAE, *priors = MODELS[model]
-
-    hparams = setup_hparams(VQVAE, dict(sample_length=1048576))
-
     # don't actually load any weights in yet,
     # leave it for later. memory optimization
     with init_empty_weights():
-        VQVAE = make_vqvae(hparams, "meta")
+        constants.VQVAE = make_vqvae(vqvae_hparams, "meta")
 
     # Set up language model
     if verbose:
         print("Setting up the top prior...")
-    hparams = setup_hparams(priors[-1], dict())
 
     # don't actually load any weights in yet,
     # leave it for later. memory optimization
     with init_empty_weights():
-        TOP_PRIOR = make_prior(hparams, VQVAE, "meta")
+        constants.TOP_PRIOR = make_prior(prior_hparams, constants.VQVAE, "meta")
 
     # flips a bit that tells the model to return activations
     # instead of projecting to tokens and getting loss for
     # forward pass
-    TOP_PRIOR.prior.only_encode = True
+    constants.TOP_PRIOR.prior.only_encode = True
 
     if verbose:
         print("Loading the top prior weights into memory...")
 
-    load_weights(TOP_PRIOR, prior_cache_path, device)
+    load_weights(constants.TOP_PRIOR, prior_cache_path, device)
 
     gc.collect()
     torch.cuda.empty_cache()
 
-    load_weights(VQVAE, vqvae_cache_path, device)
-
-    return VQVAE, TOP_PRIOR
+    load_weights(constants.VQVAE, vqvae_cache_path, device)

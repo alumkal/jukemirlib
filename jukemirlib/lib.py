@@ -6,19 +6,13 @@ import torch as t
 import gc
 import numpy as np
 
-# from .constants import DEVICE
-from . import VQVAE, TOP_PRIOR, x_cond, y_cond
-from .constants import JUKEBOX_SAMPLE_RATE, T, CTX_WINDOW_LENGTH
+from . import constants as c
 from .setup_models import *
 
 __all__ = ["load_audio", "extract"]
 
 JUKEBOX_SAMPLE_RATE = 44100
-T = 8192
-
-DEFAULT_DURATION = CTX_WINDOW_LENGTH / JUKEBOX_SAMPLE_RATE
-
-VQVAE_RATE = T / DEFAULT_DURATION
+VQVAE_RATE = JUKEBOX_SAMPLE_RATE / 128
 
 
 def empty_cache():
@@ -46,16 +40,14 @@ def load_audio(fpath, offset=0.0, duration=None):
     return audio.flatten()
 
 
-def get_z(vqvae, audio):
-    from . import DEVICE
-
+def get_z(vqvae, audio, max_length=8192):
     # don't compute unnecessary discrete encodings
     if type(audio) == type([]):
-        audio = np.array(audio)[:, : JUKEBOX_SAMPLE_RATE * 25]
+        audio = np.array(audio)[:, :max_length * 128]
     else:
-        audio = audio[np.newaxis, : JUKEBOX_SAMPLE_RATE * 25]
+        audio = audio[np.newaxis, :max_length * 128]
 
-    audio = torch.from_numpy(audio[..., np.newaxis]).to(device=DEVICE)
+    audio = torch.from_numpy(audio[..., np.newaxis]).to(device=c.DEVICE)
 
     zs = vqvae.encode(audio)
 
@@ -66,8 +58,6 @@ def get_z(vqvae, audio):
 
 
 def get_cond(top_prior):
-    from . import DEVICE
-
     # model only accepts sample length conditioning of
     # >60 seconds, so we use 62
     sample_length_in_seconds = 62
@@ -91,12 +81,12 @@ def get_cond(top_prior):
         ),
     ] * 8
 
-    labels = [None, None, top_prior.labeller.get_batch_labels(metas, DEVICE)]
+    labels = [None, None, top_prior.labeller.get_batch_labels(metas, c.DEVICE)]
 
     x_cond, y_cond, prime = top_prior.get_cond(None, top_prior.get_y(labels[-1], 0))
 
-    x_cond = x_cond[0, :T][np.newaxis, ...].to(DEVICE)
-    y_cond = y_cond[0][np.newaxis, ...].to(DEVICE)
+    x_cond = x_cond[0, :top_prior.n_ctx][np.newaxis, ...].to(c.DEVICE)
+    y_cond = y_cond[0][np.newaxis, ...].to(c.DEVICE)
 
     return x_cond, y_cond
 
@@ -107,12 +97,12 @@ def downsample(representation, target_rate=30, method=None):
 
     if method == "librosa_kaiser":
         resampled_reps = lr.resample(
-            np.asfortranarray(representation.T), T / DEFAULT_DURATION, target_rate
+            np.asfortranarray(representation.T), VQVAE_RATE, target_rate
         ).T
     elif method in ["librosa_fft", "librosa_scipy"]:
         resampled_reps = lr.resample(
             np.asfortranarray(representation.T),
-            orig_sr=T / DEFAULT_DURATION,
+            orig_sr=VQVAE_RATE,
             target_sr=target_rate,
             res_type="fft",
         ).T
@@ -129,6 +119,8 @@ def roll(x, n):
 def get_activations_custom(
     x, x_cond, y_cond, layers_to_extract=None, fp16=False, fp16_out=False
 ):
+    from .constants import TOP_PRIOR
+
     # this function is adapted from:
     # https://github.com/openai/jukebox/blob/08efbbc1d4ed1a3cef96e08a931944c8b4d63bb3/jukebox/prior/autoregressive.py#L116
 
@@ -136,7 +128,7 @@ def get_activations_custom(
     if layers_to_extract is None:
         layers_to_extract = [36]
 
-    x = x[:, :T]  # limit to max context window of Jukebox
+    x = x[:, :TOP_PRIOR.n_ctx]  # limit to max context window of Jukebox
 
     input_seq_length = x.shape[1]
 
@@ -169,7 +161,6 @@ def get_activations_custom(
         assert x_cond is None
         x_cond = t.zeros((N, 1, TOP_PRIOR.prior.width), device=x.device, dtype=t.float)
 
-    x_t = x  # Target
     # self.x_emb is just a straightforward embedding, no trickery here
     x = TOP_PRIOR.prior.x_emb(x)  # X emb
     # this is to be able to fit in a start token/conditioning info: just shift to the right by 1
@@ -244,19 +235,18 @@ def extract(
     # layers.
     force_empty_cache=True,
 ):
-    global VQVAE, TOP_PRIOR, x_cond, y_cond
     # set up the models if they have not been yet
-    if VQVAE is None and TOP_PRIOR is None:
-        VQVAE, TOP_PRIOR = setup_models()
+    if c.VQVAE is None and c.TOP_PRIOR is None:
+        c.VQVAE, c.TOP_PRIOR = setup_models()
 
     # main function that runs extraction end-to-end.
 
     if layers is None:
         layers = [36]  # by default
 
-    if audio is None:
-        assert fpath is not None
+    assert (audio is None) != (fpath is None), "Must provide either audio or fpath"
 
+    if audio is None:
         if type(fpath) == type([]):
             audio = [
                 load_audio(path, offset=offset, duration=duration) for path in fpath
@@ -267,8 +257,6 @@ def extract(
             bsize = 1
 
     elif fpath is None:
-        assert audio is not None
-
         if type(audio) == type([]):
             bsize = len(audio)
         else:
@@ -278,17 +266,16 @@ def extract(
         empty_cache()
 
     # run vq-vae on the audio to get discretized audio
-    z = get_z(VQVAE, audio)
+    z = get_z(c.VQVAE, audio, max_length=c.TOP_PRIOR.n_ctx)
 
     if force_empty_cache:
         empty_cache()
 
-    if x_cond is None or y_cond is None:
-        # get conditioning info
-        x_cond, y_cond = get_cond(TOP_PRIOR)
+    # get conditioning info
+    x_cond, y_cond = get_cond(c.TOP_PRIOR)
 
-        # avoid raising asserts
-        x_cond, y_cond = x_cond.repeat(bsize, 1, 1), y_cond.repeat(bsize, 1, 1)
+    # avoid raising asserts
+    x_cond, y_cond = x_cond.repeat(bsize, 1, 1), y_cond.repeat(bsize, 1, 1)
 
     if force_empty_cache:
         empty_cache()
